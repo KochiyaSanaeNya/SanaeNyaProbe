@@ -2,25 +2,36 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
 const (
-	defaultListen      = ":8080"
+	defaultConfigPath  = "/etc/SanaeNyaProbeServer/server.json"
 	offlineAfter       = 15 * time.Second
 	maxReceiveBodySize = 1 << 20
 )
+
+type serverConfig struct {
+	Port           int    `json:"port"`
+	PublicKeyPath  string `json:"public_key_path"`
+	PrivateKeyPath string `json:"private_key_path"`
+}
 
 type serverState struct {
 	Key              string              `json:"key"`
@@ -52,8 +63,13 @@ type store struct {
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 
-	listen := flag.String("listen", defaultListen, "HTTP listen address")
+	configPath := flag.String("config", defaultConfigPath, "JSON server config file path")
 	flag.Parse()
+
+	cfg, err := loadServerConfig(*configPath)
+	if err != nil {
+		log.Fatalf("load config: %v", err)
+	}
 
 	state := newStore()
 	mux := http.NewServeMux()
@@ -61,18 +77,21 @@ func main() {
 	mux.HandleFunc("/api/monitor", state.monitor)
 
 	server := &http.Server{
-		Addr:              *listen,
+		Addr:              cfg.listenAddr(),
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
+		TLSConfig: &tls.Config{
+			MinVersion: tls.VersionTLS12,
+		},
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	errCh := make(chan error, 1)
 	go func() {
-		log.Printf("SanaeNyaProbe server listening on %s", *listen)
-		errCh <- server.ListenAndServe()
+		log.Printf("SanaeNyaProbe server listening on https://0.0.0.0:%d", cfg.Port)
+		errCh <- server.ListenAndServeTLS(cfg.PublicKeyPath, cfg.PrivateKeyPath)
 	}()
 
 	select {
@@ -90,6 +109,44 @@ func main() {
 
 	state.stopTimers()
 	log.Print("SanaeNyaProbe server stopped")
+}
+
+func loadServerConfig(path string) (serverConfig, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return serverConfig{}, err
+	}
+	defer file.Close()
+
+	decoder := json.NewDecoder(file)
+	decoder.DisallowUnknownFields()
+
+	var cfg serverConfig
+	if err := decoder.Decode(&cfg); err != nil {
+		return serverConfig{}, err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return serverConfig{}, fmt.Errorf("config contains extra JSON values")
+	}
+
+	cfg.PublicKeyPath = strings.TrimSpace(cfg.PublicKeyPath)
+	cfg.PrivateKeyPath = strings.TrimSpace(cfg.PrivateKeyPath)
+
+	if cfg.Port < 1 || cfg.Port > 65535 {
+		return serverConfig{}, fmt.Errorf("port must be between 1 and 65535")
+	}
+	if cfg.PublicKeyPath == "" {
+		return serverConfig{}, fmt.Errorf("public_key_path is required")
+	}
+	if cfg.PrivateKeyPath == "" {
+		return serverConfig{}, fmt.Errorf("private_key_path is required")
+	}
+
+	return cfg, nil
+}
+
+func (c serverConfig) listenAddr() string {
+	return ":" + strconv.Itoa(c.Port)
 }
 
 func newStore() *store {
